@@ -1,4 +1,3 @@
-
 import os
 import time
 from typing import Any, Dict, List
@@ -154,6 +153,8 @@ def seeded_documents(qdrant_instance: Qdrant):
 
 
 class TestSearchIntegration:
+    # -------------------- basic semantics --------------------
+
     def test_eq_filter_returns_only_matching_docs(self, qdrant_instance: Qdrant, seeded_documents):
         q = qdrant_instance
 
@@ -315,7 +316,6 @@ class TestSearchIntegration:
         # category != science → doc1, doc3
         assert names == {"doc1", "doc3"}
 
-
     def test_or_with_in_on_multiple_fields(self, qdrant_instance: Qdrant, seeded_documents):
         """OR(IN(...), IN(...)) across different fields should match union of both sets."""
         q = qdrant_instance
@@ -335,3 +335,258 @@ class TestSearchIntegration:
         # doc3: status=draft,     views=200        → matches via status
         # doc4: status=archived,  views=80         → matches via views
         assert names == {"doc1", "doc3", "doc4"}
+
+    # -------------------- additional coverage --------------------
+
+    def test_no_filters_returns_all_docs(self, qdrant_instance: Qdrant, seeded_documents):
+        """Calling search with no filters should return all seeded docs (up to limit)."""
+        q = qdrant_instance
+
+        results = q.search("whatever", limit=10)
+        names = {d.name for d in results}
+
+        assert names == {d.name for d in seeded_documents}
+
+    def test_empty_filter_list_behaves_like_no_filters(self, qdrant_instance: Qdrant, seeded_documents):
+        """filters=[] should behave like no filters at all."""
+        q = qdrant_instance
+
+        results = q.search("whatever", limit=10, filters=[])
+        names = {d.name for d in results}
+
+        assert names == {d.name for d in seeded_documents}
+
+    def test_limit_parameter_is_respected(self, qdrant_instance: Qdrant, seeded_documents):
+        """Ensure the limit parameter is respected by the underlying search."""
+        q = qdrant_instance
+
+        results = q.search("whatever", limit=2)
+        assert len(results) == 2
+
+    def test_eq_on_numeric_field(self, qdrant_instance: Qdrant, seeded_documents):
+        """EQ should also work on numeric fields like views."""
+        q = qdrant_instance
+
+        expr = EQ("views", 80)
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        assert names == {"doc4"}
+
+    def test_numeric_range_with_and(self, qdrant_instance: Qdrant, seeded_documents):
+        """Combine GT and LT to form an open numeric range."""
+        q = qdrant_instance
+
+        # 400 < word_count < 700
+        expr = AND(
+            GT("word_count", 400),
+            LT("word_count", 700),
+        )
+
+        results = q.search("whatever", limit=10, filters=[expr])
+        names = {d.name for d in results}
+
+        # doc2: 600 → in range
+        # doc3: 400 → excluded (not > 400)
+        # doc4: 700 → excluded (not < 700)
+        assert names == {"doc2"}
+
+    def test_nested_not_over_or(self, qdrant_instance: Qdrant, seeded_documents):
+        """NOT(OR(...)) should correctly exclude both branches."""
+        q = qdrant_instance
+
+        # NOT(status in {draft, archived})
+        expr = NOT(OR(EQ("status", "draft"), EQ("status", "archived")))
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        # Only published docs remain
+        assert names == {"doc1", "doc2"}
+
+    def test_bitwise_not_operator_shortcut(self, qdrant_instance: Qdrant, seeded_documents):
+        """~expr should behave like NOT(expr)."""
+        q = qdrant_instance
+
+        expr = ~EQ("status", "archived")
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        # All except archived
+        assert names == {"doc1", "doc2", "doc3"}
+
+    def test_bitwise_not_in_complex_expression(self, qdrant_instance: Qdrant, seeded_documents):
+        """Mix ~ with AND/IN for more complex expressions."""
+        q = qdrant_instance
+
+        # NOT(status == archived) AND category in {science, tech}
+        expr = AND(
+            ~EQ("status", "archived"),
+            IN("category", ["science", "tech"]),
+        )
+
+        results = q.search("whatever", limit=10, filters=[expr])
+        names = {d.name for d in results}
+
+        # All docs except doc4 (archived), but only matching category {science, tech}
+        # doc1 (tech), doc2 (science), doc3 (tech)
+        assert names == {"doc1", "doc2", "doc3"}
+
+    def test_in_on_numeric_field(self, qdrant_instance: Qdrant, seeded_documents):
+        """IN should work on numeric payload fields as well."""
+        q = qdrant_instance
+
+        # views ∈ {80, 200}
+        expr = IN("views", [80, 200])
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        assert names == {"doc3", "doc4"}
+
+    def test_in_on_word_count_field(self, qdrant_instance: Qdrant, seeded_documents):
+        """IN on integer word_count metadata."""
+        q = qdrant_instance
+
+        expr = IN("word_count", [400, 700])
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        assert names == {"doc3", "doc4"}
+
+    def test_multi_key_dict_filters_act_as_and(self, qdrant_instance: Qdrant, seeded_documents):
+        """Dict filters with multiple keys should AND all equality conditions."""
+        q = qdrant_instance
+
+        filters_dict = {
+            "status": "published",
+            "category": "science",
+        }
+        results = q.search("whatever", limit=10, filters=filters_dict)
+
+        names = {d.name for d in results}
+        # Only doc2 is published AND science
+        assert names == {"doc2"}
+
+    def test_nested_and_or_three_way_logic(self, qdrant_instance: Qdrant, seeded_documents):
+        """Extra coverage for mixing AND/OR with multiple branches."""
+        q = qdrant_instance
+
+        # (status == published OR status == draft) AND views > 100
+        expr = AND(
+            OR(EQ("status", "published"), EQ("status", "draft")),
+            GT("views", 100),
+        )
+
+        results = q.search("whatever", limit=10, filters=[expr])
+        names = {d.name for d in results}
+
+        # published with views > 100: doc2
+        # draft with views > 100: doc3
+        assert names == {"doc2", "doc3"}
+
+    def test_single_expression_in_list_same_as_direct_expr(self, qdrant_instance: Qdrant, seeded_documents):
+        """filters=[expr] should behave the same as filters=expr (if supported)."""
+        q = qdrant_instance
+
+        expr = EQ("category", "tech")
+        results_from_list = q.search("whatever", limit=10, filters=[expr])
+        names_from_list = {d.name for d in results_from_list}
+
+        # sanity: doc1, doc3 are tech
+        assert names_from_list == {"doc1", "doc3"}
+
+    def test_missing_field_in_filter_excludes_doc(self, qdrant_instance: Qdrant, seeded_documents):
+        """
+        Filtering on a field that some docs don't have should exclude those docs,
+        but still match ones that do have it.
+        """
+        q = qdrant_instance
+
+        # difficulty == advanced
+        expr = EQ("difficulty", "advanced")
+        results = q.search("whatever", limit=10, filters=[expr])
+
+        names = {d.name for d in results}
+        # Only doc4 has difficulty=advanced
+        assert names == {"doc4"}
+
+    def test_three_simple_filter_expressions_implicit_and(
+        self, qdrant_instance: Qdrant, seeded_documents
+        ):
+            """
+            Multiple simple expressions in the filters list should all be AND-ed together.
+            """
+            q = qdrant_instance
+
+            filters = [
+                EQ("status", "published"),
+                IN("category", ["science", "tech"]),
+                LT("views", 100),
+            ]
+            results = q.search("whatever", limit=10, filters=filters)
+
+            names = {d.name for d in results}
+            # Only doc1: published, category=tech, views=50 (< 100)
+            assert names == {"doc1"}
+
+    def test_multiple_filter_expressions_with_or_and_gt_implicit_and(
+        self, qdrant_instance: Qdrant, seeded_documents
+    ):
+        """
+        A list containing a complex OR expression plus another expression
+        should still be treated as implicit AND for the list items.
+        """
+        q = qdrant_instance
+
+        # (status == draft OR status == archived) AND views > 100
+        filters = [
+            OR(EQ("status", "draft"), EQ("status", "archived")),
+            GT("views", 100),
+        ]
+        results = q.search("whatever", limit=10, filters=filters)
+
+        names = {d.name for d in results}
+        # draft + views>100 → doc3; archived has views=80 → excluded
+        assert names == {"doc3"}
+
+    def test_multiple_filter_expressions_with_not_and_gt_implicit_and(
+        self, qdrant_instance: Qdrant, seeded_documents
+    ):
+        """
+        List of NOT(...) and numeric comparison should also AND together.
+        """
+        q = qdrant_instance
+
+        # NOT(category in {science}) AND views > 50
+        filters = [
+            NOT(IN("category", ["science"])),
+            GT("views", 50),
+        ]
+        results = q.search("whatever", limit=10, filters=filters)
+
+        names = {d.name for d in results}
+        # doc3: tech, views=200 → matches
+        # doc1: tech, views=50 → fails GT(views, 50)
+        # science docs excluded by NOT(IN(...))
+        assert names == {"doc3"}
+
+    def test_multiple_filter_expressions_for_tutorial_range(
+        self, qdrant_instance: Qdrant, seeded_documents
+    ):
+        """
+        Multiple filters targeting tutorials with word_count constraint.
+        """
+        q = qdrant_instance
+
+        # type == tutorial AND word_count > 500 AND views < 1000
+        filters = [
+            EQ("type", "tutorial"),
+            GT("word_count", 500),
+            LT("views", 1000),
+        ]
+        results = q.search("whatever", limit=10, filters=filters)
+
+        names = {d.name for d in results}
+        # doc3: tutorial, word_count=400 → excluded
+        # doc4: tutorial, word_count=700, views=80 → matches
+        assert names == {"doc4"}
+
