@@ -90,10 +90,6 @@ def qdrant_instance(mock_embedder):
         ("difficulty", PayloadSchemaType.KEYWORD),
     ]:
         client.create_payload_index(collection_name, field_name=f"meta_data.{field}", field_schema=schema)
-  
-    
-
-
     try:
         yield q
     finally:
