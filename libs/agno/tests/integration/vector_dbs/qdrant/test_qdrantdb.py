@@ -310,3 +310,24 @@ class TestSearchIntegration:
         # draft: doc3 (tech)
         # category != science → doc1, doc3
         assert names == {"doc1", "doc3"}
+
+
+    def test_or_with_in_on_multiple_fields(self, qdrant_instance: Qdrant, seeded_documents):
+        """OR(IN(...), IN(...)) across different fields should match union of both sets."""
+        q = qdrant_instance
+
+        # status ∈ {draft}  OR  views ∈ {50, 80}
+        expr = OR(
+            IN("status", ["draft"]),
+            IN("views", [50, 80]),
+        )
+
+        results = q.search("whatever", limit=10, filters=[expr])
+        names = {d.name for d in results}
+
+        # From seeded docs:
+        # doc1: status=published, views=50         → matches via views
+        # doc2: status=published, views=150        → no match
+        # doc3: status=draft,     views=200        → matches via status
+        # doc4: status=archived,  views=80         → matches via views
+        assert names == {"doc1", "doc3", "doc4"}
