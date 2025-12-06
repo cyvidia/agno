@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    environment:
+      # Setting these vars to try to mimic QDrant Cloud default settings. This may be an incomplete list.
+      QDRANT__STORAGE__COLLECTION__STRICT_MODE__ENABLED: "true"
+      QDRANT__STORAGE__COLLECTION__STRICT_MODE__UNINDEXED_FILTERING_RETRIEVE: "false"
+      QDRANT__STORAGE__COLLECTION__STRICT_MODE__UNINDEXED_FILTERING_SEARCH: "false"
+    ports:
+      - "6333:6333"
+      - "6334:6334"
