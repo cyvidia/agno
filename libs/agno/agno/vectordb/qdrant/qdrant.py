@@ -9,7 +9,7 @@ except ImportError:
         "The `qdrant-client` package is not installed. Please install it via `pip install qdrant-client`."
     )
 
-from agno.filters import FilterExpr
+from agno.filters import FilterExpr, EQ, IN, GT, LT, AND, OR, NOT
 from agno.knowledge.document import Document
 from agno.knowledge.embedder import Embedder
 from agno.knowledge.reranker.base import Reranker
@@ -541,11 +541,7 @@ class Qdrant(VectorDb):
             filters (Optional[Dict[str, Any]]): Filters to apply while searching
         """
 
-        if isinstance(filters, List):
-            log_warning("Filters Expressions are not supported in Qdrant. No filters will be applied.")
-            filters = None
-
-        formatted_filters = self._format_filters(filters or {})  # type: ignore
+        formatted_filters = self._build_query_filter(filters)
         if self.search_type == SearchType.vector:
             results = self._run_vector_search_sync(query, limit, formatted_filters=formatted_filters)  # type: ignore
         elif self.search_type == SearchType.keyword:
@@ -560,11 +556,7 @@ class Qdrant(VectorDb):
     async def async_search(
         self, query: str, limit: int = 5, filters: Optional[Union[Dict[str, Any], List[FilterExpr]]] = None
     ) -> List[Document]:
-        if isinstance(filters, List):
-            log_warning("Filters Expressions are not supported in Qdrant. No filters will be applied.")
-            filters = None
-
-        formatted_filters = self._format_filters(filters or {})  # type: ignore
+        formatted_filters = self._build_query_filter(filters)
         if self.search_type == SearchType.vector:
             results = await self._run_vector_search_async(query, limit, formatted_filters=formatted_filters)  # type: ignore
         elif self.search_type == SearchType.keyword:
@@ -575,6 +567,135 @@ class Qdrant(VectorDb):
             raise ValueError(f"Unsupported search type: {self.search_type}")
 
         return self._build_search_results(results, query)
+    
+    # ============================================================
+    # Filter expression → Qdrant Filter conversion
+    # ============================================================
+
+    def _normalize_filter_key(self, key: str) -> str:
+        """
+        Normalize a logical filter key to the actual payload key used in Qdrant.
+
+        Mirrors the behavior of `_format_filters`:
+        - Plain keys are treated as `meta_data.<key>`
+        - Keys that already contain a dot or start with `meta_data.` are left as-is.
+        """
+        if "." not in key and not key.startswith("meta_data."):
+            return f"meta_data.{key}"
+        return key
+
+    def _convert_filter_expr_to_condition(self, expr: FilterExpr):
+        """
+        Convert a single FilterExpr (EQ / IN / GT / LT / AND / OR / NOT)
+        into a Qdrant Condition (FieldCondition or nested Filter).
+        """
+        # Comparison / inclusion
+        if isinstance(expr, EQ):
+            key = self._normalize_filter_key(expr.key)
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchValue(value=expr.value),
+            )
+
+        if isinstance(expr, IN):
+            key = self._normalize_filter_key(expr.key)
+            return models.FieldCondition(
+                key=key,
+                match=models.MatchAny(any=expr.values),
+            )
+
+        if isinstance(expr, GT):
+            key = self._normalize_filter_key(expr.key)
+            return models.FieldCondition(
+                key=key,
+                range=models.Range(gt=expr.value),
+            )
+
+        if isinstance(expr, LT):
+            key = self._normalize_filter_key(expr.key)
+            return models.FieldCondition(
+                key=key,
+                range=models.Range(lt=expr.value),
+            )
+
+        # Logical operators: AND / OR / NOT
+        if isinstance(expr, AND):
+            # AND(e1, e2, ...) → Filter(must=[cond(e1), cond(e2), ...])
+            if not expr.expressions:
+                return models.Filter()
+            conditions = [self._convert_filter_expr_to_condition(e) for e in expr.expressions]
+            return models.Filter(must=conditions)  # type: ignore[arg-type]
+
+        if isinstance(expr, OR):
+            # OR(e1, e2, ...) → Filter(should=[cond(e1), cond(e2), ...])
+            if not expr.expressions:
+                return models.Filter()
+            conditions = [self._convert_filter_expr_to_condition(e) for e in expr.expressions]
+            return models.Filter(should=conditions)  # type: ignore[arg-type]
+
+        if isinstance(expr, NOT):
+            # NOT(e) → Filter(must_not=[cond(e)])
+            inner = self._convert_filter_expr_to_condition(expr.expression)
+            return models.Filter(must_not=[inner])  # type: ignore[arg-type]
+
+        raise ValueError(f"Unsupported FilterExpr type: {type(expr)}")
+
+    def _build_filter_from_expression(self, expr: FilterExpr) -> models.Filter:
+        """
+        Ensure we always end up with a top-level models.Filter, even if the
+        expression converts directly into a FieldCondition.
+        """
+        condition = self._convert_filter_expr_to_condition(expr)
+        if isinstance(condition, models.Filter):
+            return condition
+        # Wrap a single FieldCondition in an AND-style Filter(must=[...])
+        return models.Filter(must=[condition])  # type: ignore[arg-type]
+
+    def _build_query_filter(
+        self,
+        filters: Optional[Union[Dict[str, Any], FilterExpr, List[FilterExpr], models.Filter]],
+    ) -> Optional[models.Filter]:
+        """
+        Convert whatever the caller passed in (`Dict` filters or FilterExpr list/tree)
+        into a `models.Filter` suitable for Qdrant's `query_filter` argument.
+        """
+        if filters is None:
+            return None
+
+        # Already a Qdrant Filter
+        if isinstance(filters, models.Filter):
+            return filters
+
+        # Single FilterExpr tree, e.g. AND(EQ(...), GT(...))
+        if isinstance(filters, FilterExpr):
+            return self._build_filter_from_expression(filters)
+
+        # List of FilterExpr: treat as implicit AND of the expressions
+        if isinstance(filters, list):
+            exprs: List[FilterExpr] = []
+            for f in filters:
+                if not isinstance(f, FilterExpr):
+                    log_warning(f"Unsupported filter element type {type(f)} in filter list. Skipping.")
+                    continue
+                exprs.append(f)
+
+            if not exprs:
+                return None
+
+            if len(exprs) == 1:
+                return self._build_filter_from_expression(exprs[0])
+
+            # Implicit AND at top-level
+            conditions = [self._convert_filter_expr_to_condition(e) for e in exprs]
+            return models.Filter(must=conditions)  # type: ignore[arg-type]
+
+        # Dict-based filters (existing behavior)
+        if isinstance(filters, dict):
+            return self._format_filters(filters)
+
+        log_warning(f"Unsupported filters type: {type(filters)}. Filters will be ignored.")
+        return None
+
 
     def _run_hybrid_search_sync(
         self,
