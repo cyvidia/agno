@@ -13,6 +13,8 @@ from agno.filters import EQ, IN, GT, LT, AND, OR, NOT
 from agno.vectordb.qdrant import Qdrant
 from agno.vectordb.search import SearchType
 from agno.knowledge.document import Document
+from qdrant_client.http.models import PayloadSchemaType
+
 
 
 # --------------------------------------------------------------------
@@ -74,6 +76,24 @@ def qdrant_instance(mock_embedder):
     # Create collection in real Qdrant
     q.create()
 
+    client = q._client
+    assert client is not None
+
+    # create indexes
+
+    for field, schema in [
+        ("status", PayloadSchemaType.KEYWORD),
+        ("views", PayloadSchemaType.INTEGER),
+        ("category", PayloadSchemaType.KEYWORD),
+        ("type", PayloadSchemaType.KEYWORD),
+        ("word_count", PayloadSchemaType.INTEGER),
+        ("difficulty", PayloadSchemaType.KEYWORD),
+    ]:
+        client.create_payload_index(collection_name, field_name=f"meta_data.{field}", field_schema=schema)
+  
+    
+
+
     try:
         yield q
     finally:
@@ -85,17 +105,6 @@ def qdrant_instance(mock_embedder):
             pass
 
 
-def wait_for_count(q: Qdrant, expected: int, timeout: float = 10.0) -> None:
-    """Wait until Qdrant collection has at least `expected` points."""
-    start = time.time()
-    while time.time() - start < timeout:
-        try:
-            if q.get_count() >= expected:
-                return
-        except Exception:
-            pass
-        time.sleep(0.1)
-    raise TimeoutError(f"Timed out waiting for collection to reach count {expected}")
 
 @pytest.fixture(scope="module")
 def seeded_documents(qdrant_instance: Qdrant):
@@ -103,12 +112,12 @@ def seeded_documents(qdrant_instance: Qdrant):
     docs = [
         Document(
             name="doc1",
-            content="same content for all docs",
+            content="doc 1 content",
             meta_data={"status": "published", "views": 50, "category": "tech"},
         ),
         Document(
             name="doc2",
-            content="same content for all docs",
+            content="doc 2 content",
             meta_data={
                 "status": "published",
                 "views": 150,
@@ -119,7 +128,7 @@ def seeded_documents(qdrant_instance: Qdrant):
         ),
         Document(
             name="doc3",
-            content="same content for all docs",
+            content="doc 3 content",
             meta_data={
                 "status": "draft",
                 "views": 200,
@@ -131,7 +140,7 @@ def seeded_documents(qdrant_instance: Qdrant):
         ),
         Document(
             name="doc4",
-            content="same content for all docs",
+            content="doc 4 content",
             meta_data={
                 "status": "archived",
                 "views": 80,
@@ -144,7 +153,6 @@ def seeded_documents(qdrant_instance: Qdrant):
     ]
 
     qdrant_instance.insert(content_hash="seed_hash", documents=docs, filters=None)
-    wait_for_count(qdrant_instance, expected=len(docs))
 
     return docs
 
