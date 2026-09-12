@@ -19,14 +19,18 @@ except ImportError:
 class DocxReader(Reader):
     """Reader for Doc/Docx files"""
 
-    def __init__(self, chunking_strategy: Optional[ChunkingStrategy] = DocumentChunking(), **kwargs):
+    def __init__(self, chunking_strategy: Optional[ChunkingStrategy] = None, **kwargs):
+        if chunking_strategy is None:
+            chunk_size = kwargs.get("chunk_size", 5000)
+            chunking_strategy = DocumentChunking(chunk_size=chunk_size)
         super().__init__(chunking_strategy=chunking_strategy, **kwargs)
 
     @classmethod
-    def get_supported_chunking_strategies(self) -> List[ChunkingStrategyType]:
+    def get_supported_chunking_strategies(cls) -> List[ChunkingStrategyType]:
         """Get the list of supported chunking strategies for DOCX readers."""
         return [
             ChunkingStrategyType.DOCUMENT_CHUNKER,
+            ChunkingStrategyType.CODE_CHUNKER,
             ChunkingStrategyType.FIXED_SIZE_CHUNKER,
             ChunkingStrategyType.SEMANTIC_CHUNKER,
             ChunkingStrategyType.AGENTIC_CHUNKER,
@@ -34,8 +38,10 @@ class DocxReader(Reader):
         ]
 
     @classmethod
-    def get_supported_content_types(self) -> List[ContentType]:
-        return [ContentType.DOCX, ContentType.DOC]
+    def get_supported_content_types(cls) -> List[ContentType]:
+        # .doc is deliberately absent: python-docx reads the Open XML package only, and a
+        # legacy OLE2 .doc fails to open, so advertising it offers a format that never reads.
+        return [ContentType.DOCX]
 
     def read(self, file: Union[Path, IO[Any]], name: Optional[str] = None) -> List[Document]:
         """Read a docx file and return a list of documents"""
@@ -47,11 +53,9 @@ class DocxReader(Reader):
                 docx_document = DocxDocument(str(file))
                 doc_name = name or file.stem
             else:
-                log_debug(f"Reading uploaded file: {getattr(file, 'name', 'docx_file')}")
+                log_debug(f"Reading uploaded file: {getattr(file, 'name', 'BytesIO')}")
                 docx_document = DocxDocument(file)
-                doc_name = name or (
-                    getattr(file, "name", "docx_file").split(".")[0] if hasattr(file, "name") else "docx_file"
-                )
+                doc_name = name or getattr(file, "name", "docx_file").split(".")[0]
 
             doc_content = "\n\n".join([para.text for para in docx_document.paragraphs])
 
@@ -70,7 +74,7 @@ class DocxReader(Reader):
             return documents
 
         except Exception as e:
-            log_error(f"Error reading file: {e}")
+            log_error(f"Error reading file: {str(e)}")
             return []
 
     async def async_read(self, file: Union[Path, IO[Any]], name: Optional[str] = None) -> List[Document]:
@@ -78,5 +82,5 @@ class DocxReader(Reader):
         try:
             return await asyncio.to_thread(self.read, file, name)
         except Exception as e:
-            log_error(f"Error reading file asynchronously: {e}")
+            log_error(f"Error reading file asynchronously: {str(e)}")
             return []

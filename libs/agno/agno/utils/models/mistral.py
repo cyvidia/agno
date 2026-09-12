@@ -5,20 +5,18 @@ from agno.models.message import Message
 from agno.utils.log import log_error, log_warning
 
 try:
-    # TODO: Adapt these imports to the new Mistral SDK versions
-    from mistralai.models import (  # type: ignore
-        AssistantMessage,  # type: ignore
-        ImageURLChunk,  # type: ignore
-        SystemMessage,  # type: ignore
-        TextChunk,  # type: ignore
-        ToolMessage,  # type: ignore
-        UserMessage,  # type: ignore
+    from mistralai.client.models import (
+        AssistantMessage,
+        ImageURLChunk,
+        SystemMessage,
+        TextChunk,
+        ToolMessage,
+        UserMessage,
     )
-
-    MistralMessage = Union[UserMessage, AssistantMessage, SystemMessage, ToolMessage]
-
 except ImportError:
     raise ImportError("`mistralai` not installed. Please install using `pip install mistralai`")
+
+MistralMessage = Union[UserMessage, AssistantMessage, SystemMessage, ToolMessage]
 
 
 def _format_image_for_message(image: Image) -> Optional[ImageURLChunk]:
@@ -49,6 +47,13 @@ def _format_image_for_message(image: Image) -> Optional[ImageURLChunk]:
 
 
 def format_messages(messages: List[Message], compress_tool_results: bool = False) -> List[MistralMessage]:
+    from agno.utils.message import normalize_tool_messages, reformat_tool_call_ids
+
+    # Backwards compat: expand old Gemini combined tool messages into individual canonical messages
+    messages = normalize_tool_messages(messages)
+    # Mistral requires alphanumeric tool call IDs (a-z, A-Z, 0-9) with length 9
+    messages = reformat_tool_call_ids(messages, provider="mistral")
+
     mistral_messages: List[MistralMessage] = []
 
     for message in messages:

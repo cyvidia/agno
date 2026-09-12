@@ -1,25 +1,43 @@
 import asyncio
 import base64
 import json
+import mimetypes
+import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from os import getenv
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Type, Union
+from typing import Any, Dict, Iterator, List, Optional, Type, Union, cast
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from agno.exceptions import ModelProviderError
 from agno.media import Audio, File, Image, Video
-from agno.models.base import Model
+from agno.metrics import MessageMetrics
+from agno.models.base import Model, RetryableModelProviderError
+from agno.models.google.utils import MALFORMED_FUNCTION_CALL_GUIDANCE, GeminiFinishReason, get_mime_type
 from agno.models.message import Citations, Message, UrlCitation
-from agno.models.metrics import Metrics
 from agno.models.response import ModelResponse
 from agno.run.agent import RunOutput
-from agno.utils.gemini import format_function_definitions, format_image_for_message, prepare_response_schema
+from agno.tools.function import Function
+from agno.utils.gemini import (
+    format_function_definitions,
+    format_image_for_message,
+    inject_agno_client_header,
+    prepare_response_schema,
+)
 from agno.utils.log import log_debug, log_error, log_info, log_warning
+from agno.utils.tokens import count_schema_tokens, count_text_tokens, count_tool_tokens
+
+_FUNCTION_RESPONSE_MEDIA_TYPES = {
+    "application/pdf",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/plain",
+}
 
 try:
     from google import genai
@@ -30,11 +48,13 @@ try:
         DynamicRetrievalConfig,
         FileSearch,
         FunctionCallingConfigMode,
+        FunctionResponsePart,
         GenerateContentConfig,
         GenerateContentResponse,
         GenerateContentResponseUsageMetadata,
         GoogleSearch,
         GoogleSearchRetrieval,
+        GroundingMetadata,
         Operation,
         Part,
         Retrieval,
@@ -46,10 +66,16 @@ try:
     from google.genai.types import (
         File as GeminiFile,
     )
+    from google.oauth2.service_account import Credentials
 except ImportError:
     raise ImportError(
         "`google-genai` not installed or not at the latest version. Please install it using `pip install -U google-genai`"
     )
+
+try:
+    from google.genai.types import ToolParallelAiSearch
+except ImportError:
+    ToolParallelAiSearch = None
 
 
 @dataclass
@@ -62,11 +88,12 @@ class Gemini(Model):
     - Set `vertexai` to `True` to use the Vertex AI API.
     - Set your `project_id` (or set `GOOGLE_CLOUD_PROJECT` environment variable) and `location` (optional).
     - Set `http_options` (optional) to configure the HTTP options.
+    - Set `credentials` (optional) to use the Google Cloud credentials.
 
     Based on https://googleapis.github.io/python-genai/
     """
 
-    id: str = "gemini-2.0-flash-001"
+    id: str = "gemini-3.7-flash"
     name: str = "Gemini"
     provider: str = "Google"
 
@@ -83,6 +110,15 @@ class Gemini(Model):
     url_context: bool = False
     vertexai_search: bool = False
     vertexai_search_datastore: Optional[str] = None
+
+    # Parallel web search grounding (Vertex AI only)
+    # Uses Parallel Web Systems' search API for grounding with public web data
+    parallel_search: bool = False
+    parallel_api_key: Optional[str] = None
+    # Optional custom configuration for Parallel search (e.g., domain filtering)
+    # Passed as `custom_configs` in the ToolParallelAiSearch payload.
+    # Example: {"source_policy": {"exclude_domains": ["example.com"]}}
+    parallel_config: Optional[Dict[str, Any]] = None
 
     # Gemini File Search capabilities
     file_search_store_names: Optional[List[str]] = None
@@ -105,7 +141,14 @@ class Gemini(Model):
     thinking_level: Optional[str] = None  # "low", "high"
     request_params: Optional[Dict[str, Any]] = None
 
+    # Timeout in seconds
+    timeout: Optional[float] = None
+
+    # Gemini returns cumulative token counts in each streaming chunk, so only collect on final chunk
+    collect_metrics_on_completion: bool = True
+
     # Client parameters
+    credentials: Optional[Credentials] = None
     api_key: Optional[str] = None
     vertexai: bool = False
     project_id: Optional[str] = None
@@ -154,14 +197,77 @@ class Gemini(Model):
                 log_error("GOOGLE_CLOUD_LOCATION not set. Please set the GOOGLE_CLOUD_LOCATION environment variable.")
             client_params["project"] = project_id
             client_params["location"] = location
+            if self.credentials:
+                client_params["credentials"] = self.credentials
 
         client_params = {k: v for k, v in client_params.items() if v is not None}
+
+        if self.timeout is not None:
+            http_options = client_params.get("http_options", {})
+            if isinstance(http_options, dict):
+                http_options["timeout"] = int(self.timeout * 1000)
+                client_params["http_options"] = http_options
 
         if self.client_params:
             client_params.update(self.client_params)
 
+        client_params = inject_agno_client_header(client_params)
+
         self.client = genai.Client(**client_params)
         return self.client
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert the model to a dictionary.
+
+        Returns:
+            Dict[str, Any]: The dictionary representation of the model.
+        """
+        model_dict = super().to_dict()
+        model_dict.update(
+            {
+                "search": self.search,
+                "grounding": self.grounding,
+                "grounding_dynamic_threshold": self.grounding_dynamic_threshold,
+                "url_context": self.url_context,
+                "vertexai_search": self.vertexai_search,
+                "vertexai_search_datastore": self.vertexai_search_datastore,
+                "file_search_store_names": self.file_search_store_names,
+                "file_search_metadata_filter": self.file_search_metadata_filter,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "max_output_tokens": self.max_output_tokens,
+                "stop_sequences": self.stop_sequences,
+                "logprobs": self.logprobs,
+                "presence_penalty": self.presence_penalty,
+                "frequency_penalty": self.frequency_penalty,
+                "seed": self.seed,
+                "response_modalities": self.response_modalities,
+                "thinking_budget": self.thinking_budget,
+                "include_thoughts": self.include_thoughts,
+                "thinking_level": self.thinking_level,
+                "vertexai": self.vertexai,
+                "project_id": self.project_id,
+                "location": self.location,
+            }
+        )
+        cleaned_dict = {k: v for k, v in model_dict.items() if v is not None}
+        return cleaned_dict
+
+    @staticmethod
+    def _format_unexpected_error_message(error: Exception) -> str:
+        """Return a loggable message for a generic provider exception.
+
+        - If ``str(error)`` is non-empty, pass it through unchanged. This keeps
+          existing log/error semantics intact for the common case (rate limits,
+          timeouts with a message, API error strings, etc).
+        - If ``str(error)`` is empty, fall back to the exception class name so
+          the log/ ``ModelProviderError`` still contains a debuggable token
+          instead of an empty string (the original bug).
+        """
+        error_message = str(error).strip()
+        return error_message or type(error).__name__
 
     def _append_file_search_tool(self, builtin_tools: List[Tool]) -> None:
         """Append Gemini File Search tool to builtin_tools if file search is enabled.
@@ -243,8 +349,8 @@ class Gemini(Model):
         builtin_tools = []
 
         if self.grounding:
-            log_info(
-                "Grounding enabled. This is a legacy tool. For Gemini 2.0+ Please use enable `search` flag instead."
+            log_debug(
+                "Gemini Grounding enabled. This is a legacy tool. For Gemini 2.0+ Please use enable `search` flag instead."
             )
             builtin_tools.append(
                 Tool(
@@ -257,15 +363,15 @@ class Gemini(Model):
             )
 
         if self.search:
-            log_info("Google Search enabled.")
+            log_debug("Gemini Google Search enabled.")
             builtin_tools.append(Tool(google_search=GoogleSearch()))
 
         if self.url_context:
-            log_info("URL context enabled.")
+            log_debug("Gemini URL context enabled.")
             builtin_tools.append(Tool(url_context=UrlContext()))
 
         if self.vertexai_search:
-            log_info("Vertex AI Search enabled.")
+            log_debug("Gemini Vertex AI Search enabled.")
             if not self.vertexai_search_datastore:
                 log_error("vertexai_search_datastore must be provided when vertexai_search is enabled.")
                 raise ValueError("vertexai_search_datastore must be provided when vertexai_search is enabled.")
@@ -274,6 +380,29 @@ class Gemini(Model):
             )
 
         self._append_file_search_tool(builtin_tools)
+
+        # Build Parallel web search grounding tool
+        if self.parallel_search:
+            log_debug("Gemini Parallel web search grounding enabled.")
+            if not self.vertexai:
+                raise ValueError("Parallel search grounding requires vertexai=True.")
+            if self.search or self.grounding:
+                raise ValueError(
+                    "Parallel search grounding cannot be combined with google_search or grounding tools. "
+                    "Disable `search` and `grounding` when using `parallel_search`."
+                )
+            if ToolParallelAiSearch is None:
+                raise ImportError(
+                    "ToolParallelAiSearch is not available in your version of `google-genai`. "
+                    "Please upgrade using `pip install -U google-genai`."
+                )
+            parallel_tool_config: Dict[str, Any] = {}
+            parallel_key = self.parallel_api_key or getenv("PARALLEL_API_KEY")
+            if parallel_key:
+                parallel_tool_config["api_key"] = parallel_key
+            if self.parallel_config:
+                parallel_tool_config["custom_configs"] = self.parallel_config
+            builtin_tools.append(Tool(parallel_ai_search=ToolParallelAiSearch(**parallel_tool_config)))
 
         # Set tools in config
         if builtin_tools:
@@ -308,6 +437,113 @@ class Gemini(Model):
             log_debug(f"Calling {self.provider} with request parameters: {request_params}", log_level=2)
         return request_params
 
+    def count_tokens(
+        self,
+        messages: List[Message],
+        tools: Optional[List[Union[Function, Dict[str, Any]]]] = None,
+        output_schema: Optional[Union[Dict, Type[BaseModel]]] = None,
+    ) -> int:
+        contents, system_instruction = self._format_messages(messages, compress_tool_results=True)
+        schema_tokens = count_schema_tokens(output_schema, self.id)
+
+        if self.vertexai:
+            # VertexAI supports full token counting with system_instruction and tools
+            config: Dict[str, Any] = {}
+            if system_instruction:
+                config["system_instruction"] = system_instruction
+            if tools:
+                formatted_tools = self._format_tools(tools)
+                gemini_tools = format_function_definitions(formatted_tools)
+                if gemini_tools:
+                    config["tools"] = [gemini_tools]
+
+            response = self.get_client().models.count_tokens(
+                model=self.id,
+                contents=contents,
+                config=config if config else None,  # type: ignore
+            )
+            return (response.total_tokens or 0) + schema_tokens
+        else:
+            # Google AI Studio: Use API for content tokens + local estimation for system/tools
+            # The API doesn't support system_instruction or tools in config, so we use a hybrid approach:
+            # 1. Get accurate token count for contents (text + multimodal) from API
+            # 2. Add estimated tokens for system_instruction and tools locally
+            try:
+                response = self.get_client().models.count_tokens(
+                    model=self.id,
+                    contents=contents,
+                )
+                total = response.total_tokens or 0
+            except Exception as e:
+                log_warning(f"Gemini count_tokens API failed. Falling back to tiktoken-based estimation.: {str(e)}")
+                return super().count_tokens(messages, tools, output_schema)
+
+            # Add estimated tokens for system instruction (not supported by Google AI Studio API)
+            if system_instruction:
+                system_text = system_instruction if isinstance(system_instruction, str) else str(system_instruction)
+                total += count_text_tokens(system_text, self.id)
+
+            # Add estimated tokens for tools (not supported by Google AI Studio API)
+            if tools:
+                total += count_tool_tokens(tools, self.id)
+
+            # Add estimated tokens for response_format/output_schema
+            total += schema_tokens
+
+            return total
+
+    async def acount_tokens(
+        self,
+        messages: List[Message],
+        tools: Optional[List[Union[Function, Dict[str, Any]]]] = None,
+        output_schema: Optional[Union[Dict, Type[BaseModel]]] = None,
+    ) -> int:
+        contents, system_instruction = self._format_messages(messages, compress_tool_results=True)
+        schema_tokens = count_schema_tokens(output_schema, self.id)
+
+        # VertexAI supports full token counting with system_instruction and tools
+        if self.vertexai:
+            config: Dict[str, Any] = {}
+            if system_instruction:
+                config["system_instruction"] = system_instruction
+            if tools:
+                formatted_tools = self._format_tools(tools)
+                gemini_tools = format_function_definitions(formatted_tools)
+                if gemini_tools:
+                    config["tools"] = [gemini_tools]
+
+            response = await self.get_client().aio.models.count_tokens(
+                model=self.id,
+                contents=contents,
+                config=config if config else None,  # type: ignore
+            )
+            return (response.total_tokens or 0) + schema_tokens
+        else:
+            # Hybrid approach - Google AI Studio does not support system_instruction or tools in config
+            try:
+                response = await self.get_client().aio.models.count_tokens(
+                    model=self.id,
+                    contents=contents,
+                )
+                total = response.total_tokens or 0
+            except Exception as e:
+                log_warning(f"Gemini count_tokens API failed. Falling back to tiktoken-based estimation.: {str(e)}")
+                return await super().acount_tokens(messages, tools, output_schema)
+
+            # Add estimated tokens for system instruction
+            if system_instruction:
+                system_text = system_instruction if isinstance(system_instruction, str) else str(system_instruction)
+                total += count_text_tokens(system_text, self.id)
+
+            # Add estimated tokens for tools
+            if tools:
+                total += count_tool_tokens(tools, self.id)
+
+            # Add estimated tokens for response_format/output_schema
+            total += schema_tokens
+
+            return total
+
     def invoke(
         self,
         messages: List[Message],
@@ -317,6 +553,7 @@ class Gemini(Model):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        retry_with_guidance: bool = False,
     ) -> ModelResponse:
         """
         Invokes the model with a list of messages and returns the response.
@@ -326,9 +563,6 @@ class Gemini(Model):
             system_message, response_format=response_format, tools=tools, tool_choice=tool_choice
         )
         try:
-            if run_response and run_response.metrics:
-                run_response.metrics.set_time_to_first_token()
-
             assistant_message.metrics.start_timer()
             provider_response = self.get_client().models.generate_content(
                 model=self.id,
@@ -337,22 +571,36 @@ class Gemini(Model):
             )
             assistant_message.metrics.stop_timer()
 
-            model_response = self._parse_provider_response(provider_response, response_format=response_format)
+            model_response = self._parse_provider_response(
+                provider_response, response_format=response_format, retry_with_guidance=retry_with_guidance
+            )
+
+            # If we were retrying the invoke with guidance, remove the guidance message
+            if retry_with_guidance is True:
+                self._remove_temporary_messages(messages)
 
             return model_response
 
         except (ClientError, ServerError) as e:
-            log_error(f"Error from Gemini API: {e}")
-            error_message = str(e.response) if hasattr(e, "response") else str(e)
+            log_error(f"Error from Gemini API: {str(e)}")
+            error_message = str(e)
+            if hasattr(e, "response"):
+                if hasattr(e.response, "text"):
+                    error_message = e.response.text
+                else:
+                    error_message = str(e.response)
             raise ModelProviderError(
                 message=error_message,
                 status_code=e.code if hasattr(e, "code") and e.code is not None else 502,
                 model_name=self.name,
                 model_id=self.id,
             ) from e
+        except RetryableModelProviderError:
+            raise
         except Exception as e:
-            log_error(f"Unknown error from Gemini API: {e}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_message = self._format_unexpected_error_message(e)
+            log_error(f"Unknown error from Gemini API: {error_message}")
+            raise ModelProviderError(message=error_message, model_name=self.name, model_id=self.id) from e
 
     def invoke_stream(
         self,
@@ -363,6 +611,7 @@ class Gemini(Model):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        retry_with_guidance: bool = False,
     ) -> Iterator[ModelResponse]:
         """
         Invokes the model with a list of messages and returns the response as a stream.
@@ -373,30 +622,40 @@ class Gemini(Model):
             system_message, response_format=response_format, tools=tools, tool_choice=tool_choice
         )
         try:
-            if run_response and run_response.metrics:
-                run_response.metrics.set_time_to_first_token()
-
             assistant_message.metrics.start_timer()
             for response in self.get_client().models.generate_content_stream(
                 model=self.id,
                 contents=formatted_messages,
                 **request_kwargs,
             ):
-                yield self._parse_provider_response_delta(response)
+                yield self._parse_provider_response_delta(response, retry_with_guidance=retry_with_guidance)
+
+            # If we were retrying the invoke with guidance, remove the guidance message
+            if retry_with_guidance is True:
+                self._remove_temporary_messages(messages)
 
             assistant_message.metrics.stop_timer()
 
         except (ClientError, ServerError) as e:
-            log_error(f"Error from Gemini API: {e}")
+            log_error(f"Error from Gemini API: {str(e)}")
+            error_message = str(e)
+            if hasattr(e, "response"):
+                if hasattr(e.response, "text"):
+                    error_message = e.response.text
+                else:
+                    error_message = str(e.response)
             raise ModelProviderError(
-                message=str(e.response) if hasattr(e, "response") else str(e),
+                message=error_message,
                 status_code=e.code if hasattr(e, "code") and e.code is not None else 502,
                 model_name=self.name,
                 model_id=self.id,
             ) from e
+        except RetryableModelProviderError:
+            raise
         except Exception as e:
-            log_error(f"Unknown error from Gemini API: {e}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_message = self._format_unexpected_error_message(e)
+            log_error(f"Unknown error from Gemini API: {error_message}")
+            raise ModelProviderError(message=error_message, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke(
         self,
@@ -407,6 +666,7 @@ class Gemini(Model):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        retry_with_guidance: bool = False,
     ) -> ModelResponse:
         """
         Invokes the model with a list of messages and returns the response.
@@ -418,9 +678,6 @@ class Gemini(Model):
         )
 
         try:
-            if run_response and run_response.metrics:
-                run_response.metrics.set_time_to_first_token()
-
             assistant_message.metrics.start_timer()
             provider_response = await self.get_client().aio.models.generate_content(
                 model=self.id,
@@ -429,21 +686,36 @@ class Gemini(Model):
             )
             assistant_message.metrics.stop_timer()
 
-            model_response = self._parse_provider_response(provider_response, response_format=response_format)
+            model_response = self._parse_provider_response(
+                provider_response, response_format=response_format, retry_with_guidance=retry_with_guidance
+            )
+
+            # If we were retrying the invoke with guidance, remove the guidance message
+            if retry_with_guidance is True:
+                self._remove_temporary_messages(messages)
 
             return model_response
 
         except (ClientError, ServerError) as e:
-            log_error(f"Error from Gemini API: {e}")
+            log_error(f"Error from Gemini API: {str(e)}")
+            error_message = str(e)
+            if hasattr(e, "response"):
+                if hasattr(e.response, "text"):
+                    error_message = e.response.text
+                else:
+                    error_message = str(e.response)
             raise ModelProviderError(
-                message=str(e.response) if hasattr(e, "response") else str(e),
+                message=error_message,
                 status_code=e.code if hasattr(e, "code") and e.code is not None else 502,
                 model_name=self.name,
                 model_id=self.id,
             ) from e
+        except RetryableModelProviderError:
+            raise
         except Exception as e:
-            log_error(f"Unknown error from Gemini API: {e}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_message = self._format_unexpected_error_message(e)
+            log_error(f"Unknown error from Gemini API: {error_message}")
+            raise ModelProviderError(message=error_message, model_name=self.name, model_id=self.id) from e
 
     async def ainvoke_stream(
         self,
@@ -454,6 +726,7 @@ class Gemini(Model):
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         run_response: Optional[RunOutput] = None,
         compress_tool_results: bool = False,
+        retry_with_guidance: bool = False,
     ) -> AsyncIterator[ModelResponse]:
         """
         Invokes the model with a list of messages and returns the response as a stream.
@@ -465,9 +738,6 @@ class Gemini(Model):
         )
 
         try:
-            if run_response and run_response.metrics:
-                run_response.metrics.set_time_to_first_token()
-
             assistant_message.metrics.start_timer()
 
             async_stream = await self.get_client().aio.models.generate_content_stream(
@@ -476,21 +746,34 @@ class Gemini(Model):
                 **request_kwargs,
             )
             async for chunk in async_stream:
-                yield self._parse_provider_response_delta(chunk)
+                yield self._parse_provider_response_delta(chunk, retry_with_guidance=retry_with_guidance)
+
+            # If we were retrying the invoke with guidance, remove the guidance message
+            if retry_with_guidance is True:
+                self._remove_temporary_messages(messages)
 
             assistant_message.metrics.stop_timer()
 
         except (ClientError, ServerError) as e:
-            log_error(f"Error from Gemini API: {e}")
+            log_error(f"Error from Gemini API: {str(e)}")
+            error_message = str(e)
+            if hasattr(e, "response"):
+                if hasattr(e.response, "text"):
+                    error_message = e.response.text
+                else:
+                    error_message = str(e.response)
             raise ModelProviderError(
-                message=str(e.response) if hasattr(e, "response") else str(e),
+                message=error_message,
                 status_code=e.code if hasattr(e, "code") and e.code is not None else 502,
                 model_name=self.name,
                 model_id=self.id,
             ) from e
+        except RetryableModelProviderError:
+            raise
         except Exception as e:
-            log_error(f"Unknown error from Gemini API: {e}")
-            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+            error_message = self._format_unexpected_error_message(e)
+            log_error(f"Unknown error from Gemini API: {error_message}")
+            raise ModelProviderError(message=error_message, model_name=self.name, model_id=self.id) from e
 
     def _format_messages(self, messages: List[Message], compress_tool_results: bool = False):
         """
@@ -500,11 +783,18 @@ class Gemini(Model):
             messages (List[Message]): The list of messages to convert.
             compress_tool_results: Whether to compress tool results.
         """
+        from agno.utils.message import normalize_tool_messages
+
+        # Backwards compat: expand old Gemini combined tool messages into individual canonical messages
+        messages = normalize_tool_messages(messages)
+
         formatted_messages: List = []
-        file_content: Optional[Union[GeminiFile, Part]] = None
         system_message = None
 
         for message in messages:
+            is_tool_result = (
+                message.role == "tool" and message.tool_call_id is not None and message.tool_name is not None
+            )
             role = message.role
             if role in ["system", "developer"]:
                 system_message = message.content
@@ -528,35 +818,33 @@ class Gemini(Model):
                         part.thought_signature = base64.b64decode(message.provider_data["thought_signature"])
                     message_parts.append(part)
                 for tool_call in message.tool_calls:
+                    try:
+                        args = (
+                            json.loads(tool_call["function"]["arguments"])
+                            if "arguments" in tool_call.get("function", {})
+                            else {}
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
                     part = Part.from_function_call(
                         name=tool_call["function"]["name"],
-                        args=json.loads(tool_call["function"]["arguments"]),
+                        args=args,
                     )
                     if "thought_signature" in tool_call:
                         part.thought_signature = base64.b64decode(tool_call["thought_signature"])
                     message_parts.append(part)
-            # Function call results
-            elif message.tool_calls is not None and len(message.tool_calls) > 0:
-                for idx, tool_call in enumerate(message.tool_calls):
-                    if isinstance(content, list) and idx < len(content):
-                        original_from_list = content[idx]
-
-                        if compress_tool_results:
-                            compressed_from_tool_call = tool_call.get("content")
-                            tc_content = compressed_from_tool_call if compressed_from_tool_call else original_from_list
-                        else:
-                            tc_content = original_from_list
-                    else:
-                        tc_content = message.get_content(use_compressed_content=compress_tool_results)
-
-                        if tc_content is None:
-                            tc_content = tool_call.get("content")
-                            if tc_content is None:
-                                tc_content = content
-
-                    message_parts.append(
-                        Part.from_function_response(name=tool_call["tool_name"], response={"result": tc_content})
+            # Individual tool result message (canonical format)
+            elif message.role == "tool" and message.tool_call_id is not None and message.tool_name is not None:
+                tc_content = message.get_content(use_compressed_content=compress_tool_results)
+                media_parts, fallback_media_parts = self._format_tool_result_media(message)
+                message_parts.append(
+                    Part.from_function_response(
+                        name=message.tool_name,
+                        response={"result": tc_content},
+                        parts=media_parts or None,
                     )
+                )
+                message_parts.extend(fallback_media_parts)
             # Regular text content
             else:
                 if isinstance(content, str):
@@ -565,7 +853,7 @@ class Gemini(Model):
                         part.thought_signature = base64.b64decode(message.provider_data["thought_signature"])
                     message_parts = [part]
 
-            if role == "user" and message.tool_calls is None:
+            if role == "user" and message.tool_calls is None and not is_tool_result:
                 # Add images to the message for the model
                 if message.images is not None:
                     for image in message.images:
@@ -584,17 +872,19 @@ class Gemini(Model):
                             # Case 1: Video is a file_types.File object (Recommended)
                             # Add it as a File object
                             if video.content is not None and isinstance(video.content, GeminiFile):
+                                # The content annotation says bytes, but uploaded videos carry a File
+                                gemini_video = cast(GeminiFile, video.content)
                                 # Google recommends that if using a single video, place the text prompt after the video.
-                                if video.content.uri and video.content.mime_type:
+                                if gemini_video.uri and gemini_video.mime_type:
                                     message_parts.insert(
-                                        0, Part.from_uri(file_uri=video.content.uri, mime_type=video.content.mime_type)
+                                        0, Part.from_uri(file_uri=gemini_video.uri, mime_type=gemini_video.mime_type)
                                     )
                             else:
                                 video_file = self._format_video_for_message(video)
                                 if video_file is not None:
                                     message_parts.insert(0, video_file)
                     except Exception as e:
-                        log_warning(f"Failed to load video from {message.videos}: {e}")
+                        log_warning(f"Failed to load video from {message.videos}: {str(e)}")
                         continue
 
                 # Add audio to the message for the model
@@ -602,13 +892,15 @@ class Gemini(Model):
                     try:
                         for audio_snippet in message.audio:
                             if audio_snippet.content is not None and isinstance(audio_snippet.content, GeminiFile):
+                                # The content annotation says bytes, but uploaded audio carries a File
+                                gemini_audio = cast(GeminiFile, audio_snippet.content)
                                 # Google recommends that if using a single audio file, place the text prompt after the audio file.
-                                if audio_snippet.content.uri and audio_snippet.content.mime_type:
+                                if gemini_audio.uri and gemini_audio.mime_type:
                                     message_parts.insert(
                                         0,
                                         Part.from_uri(
-                                            file_uri=audio_snippet.content.uri,
-                                            mime_type=audio_snippet.content.mime_type,
+                                            file_uri=gemini_audio.uri,
+                                            mime_type=gemini_audio.mime_type,
                                         ),
                                     )
                             else:
@@ -616,7 +908,7 @@ class Gemini(Model):
                                 if audio_content:
                                     message_parts.append(audio_content)
                     except Exception as e:
-                        log_warning(f"Failed to load audio from {message.audio}: {e}")
+                        log_warning(f"Failed to load audio from {message.audio}: {str(e)}")
                         continue
 
                 # Add files to the message for the model
@@ -624,27 +916,116 @@ class Gemini(Model):
                     for file in message.files:
                         file_content = self._format_file_for_message(file)
                         if isinstance(file_content, Part):
-                            formatted_messages.append(file_content)
+                            message_parts.append(file_content)
+
+            # Skip messages with empty parts to avoid Gemini API error:
+            # "must include at least one parts field"
+            if not message_parts:
+                log_debug(f"Skipping message with role '{role}' that has no parts")
+                continue
 
             final_message = Content(role=role, parts=message_parts)
             formatted_messages.append(final_message)
 
-            if isinstance(file_content, GeminiFile):
-                formatted_messages.insert(0, file_content)
+        # Merge consecutive messages with the same role (Gemini API rejects consecutive same-role messages)
+        merged: List[Content] = []
+        for msg in formatted_messages:
+            if merged and merged[-1].role == msg.role:
+                merged[-1].parts.extend(msg.parts)
+            else:
+                merged.append(msg)
 
-        return formatted_messages, system_message
+        return merged, system_message
+
+    def _to_function_response_part(self, part: Part) -> Optional[FunctionResponsePart]:
+        if not self._supports_multimodal_function_responses():
+            return None
+
+        if (
+            part.inline_data is not None
+            and part.inline_data.data is not None
+            and part.inline_data.mime_type is not None
+            and part.inline_data.mime_type in _FUNCTION_RESPONSE_MEDIA_TYPES
+        ):
+            return FunctionResponsePart.from_bytes(
+                data=part.inline_data.data,
+                mime_type=part.inline_data.mime_type,
+            )
+        if (
+            self.vertexai
+            and part.file_data is not None
+            and part.file_data.file_uri is not None
+            and part.file_data.mime_type in _FUNCTION_RESPONSE_MEDIA_TYPES
+        ):
+            return FunctionResponsePart.from_uri(
+                file_uri=part.file_data.file_uri,
+                mime_type=part.file_data.mime_type,
+            )
+        return None
+
+    def _supports_multimodal_function_responses(self) -> bool:
+        model_version = re.search(r"(?:^|/)gemini-(\d+)(?:\.\d+)?(?:-|$)", self.id)
+        return model_version is not None and int(model_version.group(1)) >= 3
+
+    def _format_tool_result_media(self, message: Message) -> tuple[List[FunctionResponsePart], List[Part]]:
+        media_parts: List[FunctionResponsePart] = []
+        fallback_media_parts: List[Part] = []
+
+        def add_media_part(part: Part) -> None:
+            response_part = self._to_function_response_part(part)
+            if response_part is not None:
+                media_parts.append(response_part)
+            else:
+                fallback_media_parts.append(part)
+
+        if message.images is not None:
+            for image in message.images:
+                if image.content is not None and isinstance(image.content, GeminiFile):
+                    if image.content.uri and image.content.mime_type:  # type: ignore[attr-defined]
+                        add_media_part(
+                            Part.from_uri(
+                                file_uri=image.content.uri,  # type: ignore[attr-defined]
+                                mime_type=image.content.mime_type,  # type: ignore[attr-defined]
+                            )
+                        )
+                else:
+                    image_content = format_image_for_message(image)
+                    if image_content:
+                        add_media_part(Part.from_bytes(**image_content))
+
+        if message.videos is not None:
+            for video in message.videos:
+                video_part = self._format_video_for_message(video)
+                if video_part is not None:
+                    add_media_part(video_part)
+
+        if message.audio is not None:
+            for audio in message.audio:
+                audio_part = self._format_audio_for_message(audio)
+                if isinstance(audio_part, Part):
+                    add_media_part(audio_part)
+                elif isinstance(audio_part, GeminiFile) and audio_part.uri and audio_part.mime_type:
+                    add_media_part(Part.from_uri(file_uri=audio_part.uri, mime_type=audio_part.mime_type))
+
+        if message.files is not None:
+            for file in message.files:
+                file_part = self._format_file_for_message(file)
+                if file_part is not None:
+                    add_media_part(file_part)
+
+        return media_parts, fallback_media_parts
 
     def _format_audio_for_message(self, audio: Audio) -> Optional[Union[Part, GeminiFile]]:
+        mime_type = get_mime_type(audio, "audio/mp3")
+
         # Case 1: Audio is a bytes object
         if audio.content and isinstance(audio.content, bytes):
-            mime_type = f"audio/{audio.format}" if audio.format else "audio/mp3"
             return Part.from_bytes(mime_type=mime_type, data=audio.content)
 
         # Case 2: Audio is an url
         elif audio.url is not None:
             audio_bytes = audio.get_content_bytes()  # type: ignore
             if audio_bytes is not None:
-                mime_type = f"audio/{audio.format}" if audio.format else "audio/mp3"
                 return Part.from_bytes(mime_type=mime_type, data=audio_bytes)
             else:
                 log_warning(f"Failed to download audio from {audio}")
@@ -661,7 +1042,7 @@ class Gemini(Model):
                 if remote_file_name:
                     existing_audio_upload = self.get_client().files.get(name=remote_file_name)
             except Exception as e:
-                log_warning(f"Error getting file {remote_file_name}: {e}")
+                log_warning(f"Error getting file {remote_file_name}: {str(e)}")
 
             if existing_audio_upload and existing_audio_upload.state and existing_audio_upload.state.name == "SUCCESS":
                 audio_file = existing_audio_upload
@@ -673,7 +1054,7 @@ class Gemini(Model):
                         config=dict(
                             name=remote_file_name,
                             display_name=audio_path.stem,
-                            mime_type=f"audio/{audio.format}" if audio.format else "audio/mp3",
+                            mime_type=mime_type,
                         ),
                     )
                 else:
@@ -691,7 +1072,6 @@ class Gemini(Model):
                     return None
 
             if audio_file.uri:
-                mime_type = f"audio/{audio.format}" if audio.format else "audio/mp3"
                 return Part.from_uri(file_uri=audio_file.uri, mime_type=mime_type)
             return None
         else:
@@ -699,9 +1079,10 @@ class Gemini(Model):
             return None
 
     def _format_video_for_message(self, video: Video) -> Optional[Part]:
+        mime_type = get_mime_type(video, "video/mp4")
+
         # Case 1: Video is a bytes object
         if video.content and isinstance(video.content, bytes):
-            mime_type = f"video/{video.format}" if video.format else "video/mp4"
             return Part.from_bytes(mime_type=mime_type, data=video.content)
         # Case 2: Video is stored locally
         elif video.filepath is not None:
@@ -714,7 +1095,7 @@ class Gemini(Model):
                 if remote_file_name:
                     existing_video_upload = self.get_client().files.get(name=remote_file_name)
             except Exception as e:
-                log_warning(f"Error getting file {remote_file_name}: {e}")
+                log_warning(f"Error getting file {remote_file_name}: {str(e)}")
 
             if existing_video_upload and existing_video_upload.state and existing_video_upload.state.name == "SUCCESS":
                 video_file = existing_video_upload
@@ -726,7 +1107,7 @@ class Gemini(Model):
                         config=dict(
                             name=remote_file_name,
                             display_name=video_path.stem,
-                            mime_type=f"video/{video.format}" if video.format else "video/mp4",
+                            mime_type=mime_type,
                         ),
                     )
                 else:
@@ -744,12 +1125,10 @@ class Gemini(Model):
                     return None
 
             if video_file.uri:
-                mime_type = f"video/{video.format}" if video.format else "video/mp4"
                 return Part.from_uri(file_uri=video_file.uri, mime_type=mime_type)
             return None
         # Case 3: Video is a URL
         elif video.url is not None:
-            mime_type = f"video/{video.format}" if video.format else "video/webm"
             return Part.from_uri(
                 file_uri=video.url,
                 mime_type=mime_type,
@@ -760,16 +1139,30 @@ class Gemini(Model):
 
     def _format_file_for_message(self, file: File) -> Optional[Part]:
         # Case 1: File is a bytes object
-        if file.content and isinstance(file.content, bytes) and file.mime_type:
-            return Part.from_bytes(mime_type=file.mime_type, data=file.content)
+        if file.content and isinstance(file.content, bytes):
+            _mime = file.mime_type or mimetypes.guess_type(file.filename or "")[0] or "application/pdf"
+            return Part.from_bytes(mime_type=_mime, data=file.content)
 
         # Case 2: File is a URL
         elif file.url is not None:
+            # Case 2a: GCS URI (gs://) - pass directly to Gemini (supports up to 2GB)
+            if file.url.startswith("gs://"):
+                _mime = file.mime_type or mimetypes.guess_type(file.url)[0] or "application/pdf"
+                return Part.from_uri(file_uri=file.url, mime_type=_mime)
+
+            # Case 2b: HTTPS URL with known mime_type - pass directly to Gemini (supports up to 100MB)
+            # URLs without mime_type fall through to Case 2c (download + detect) because
+            # Gemini servers may not be able to access private/auth URLs directly.
+            if file.url.startswith("https://") and file.mime_type:
+                return Part.from_uri(file_uri=file.url, mime_type=file.mime_type)
+
+            # Case 2c: Other URL schemes - download and detect
             url_content = file.file_url_content
             if url_content is not None:
                 content, mime_type = url_content
-                if mime_type and content:
-                    return Part.from_bytes(mime_type=mime_type, data=content)
+                if content:
+                    _mime = mime_type or mimetypes.guess_type(file.url)[0] or "application/pdf"
+                    return Part.from_bytes(mime_type=_mime, data=content)
             log_warning(f"Failed to download file from {file.url}")
             return None
 
@@ -778,19 +1171,10 @@ class Gemini(Model):
             file_path = file.filepath if isinstance(file.filepath, Path) else Path(file.filepath)
             if file_path.exists() and file_path.is_file():
                 if file_path.stat().st_size < 20 * 1024 * 1024:  # 20MB in bytes
-                    if file.mime_type:
-                        file_content = file_path.read_bytes()
-                        if file_content:
-                            return Part.from_bytes(mime_type=file.mime_type, data=file_content)
-                    else:
-                        import mimetypes
-
-                        mime_type_guess = mimetypes.guess_type(file_path)[0]
-                        if mime_type_guess is not None:
-                            file_content = file_path.read_bytes()
-                            if file_content:
-                                mime_type_str: str = str(mime_type_guess)
-                                return Part.from_bytes(mime_type=mime_type_str, data=file_content)
+                    file_content = file_path.read_bytes()
+                    if file_content:
+                        _mime = file.mime_type or mimetypes.guess_type(str(file_path))[0] or "application/pdf"
+                        return Part.from_bytes(mime_type=_mime, data=file_content)
                     return None
                 else:
                     clean_file_name = f"files/{file_path.stem.lower().replace('_', '')}"
@@ -799,7 +1183,7 @@ class Gemini(Model):
                         if clean_file_name:
                             remote_file = self.get_client().files.get(name=clean_file_name)
                     except Exception as e:
-                        log_warning(f"Error getting file {clean_file_name}: {e}")
+                        log_warning(f"Error getting file {clean_file_name}: {str(e)}")
 
                     if (
                         remote_file
@@ -832,41 +1216,18 @@ class Gemini(Model):
         """
         Format function call results for Gemini.
 
-        For combined messages:
-        - content: list of ORIGINAL content (for preservation)
-        - tool_calls[i]["content"]: compressed content if available (for API sending)
-
-        This allows the message to be saved with both original and compressed versions.
+        Stores individual Message per tool result in the canonical format, matching
+        OpenAI/Claude behavior for cross-model compatibility.
         """
-        combined_original_content: List = []
-        combined_function_result: List = []
-        message_metrics = Metrics()
-
         if len(function_call_results) > 0:
-            for idx, result in enumerate(function_call_results):
-                combined_original_content.append(result.content)
-                compressed_content = result.get_content(use_compressed_content=compress_tool_results)
-                combined_function_result.append(
-                    {"tool_call_id": result.tool_call_id, "tool_name": result.tool_name, "content": compressed_content}
-                )
-                message_metrics += result.metrics
-
-        if combined_original_content:
-            messages.append(
-                Message(
-                    role="tool",
-                    content=combined_original_content,
-                    tool_calls=combined_function_result,
-                    metrics=message_metrics,
-                )
-            )
+            messages.extend(function_call_results)
 
     def _parse_provider_response(self, response: GenerateContentResponse, **kwargs) -> ModelResponse:
         """
-        Parse the OpenAI response into a ModelResponse.
+        Parse the Gemini response into a ModelResponse.
 
         Args:
-            response: Raw response from OpenAI
+            response: Raw response from Gemini
 
         Returns:
             ModelResponse: Parsed response data
@@ -875,8 +1236,20 @@ class Gemini(Model):
 
         # Get response message
         response_message = Content(role="model", parts=[])
-        if response.candidates and response.candidates[0].content:
-            response_message = response.candidates[0].content
+        if response.candidates and len(response.candidates) > 0:
+            candidate = response.candidates[0]
+
+            # Raise if the request failed because of a malformed function call
+            if hasattr(candidate, "finish_reason") and candidate.finish_reason:
+                if candidate.finish_reason == GeminiFinishReason.MALFORMED_FUNCTION_CALL.value:
+                    if self.retry_with_guidance:
+                        raise RetryableModelProviderError(
+                            retry_guidance_message=MALFORMED_FUNCTION_CALL_GUIDANCE,
+                            original_error=f"Generation ended with finish reason: {candidate.finish_reason}",
+                        )
+
+            if candidate.content:
+                response_message = candidate.content
 
         # Add role
         if response_message.role is not None:
@@ -963,27 +1336,24 @@ class Gemini(Model):
             citations = Citations()
             citations_raw = {}
             citations_urls = []
+            web_search_queries: List[str] = []
 
             if response.candidates and response.candidates[0].grounding_metadata is not None:
-                grounding_metadata = response.candidates[0].grounding_metadata.model_dump()
-                citations_raw["grounding_metadata"] = grounding_metadata
+                grounding_metadata: GroundingMetadata = response.candidates[0].grounding_metadata
+                citations_raw["grounding_metadata"] = grounding_metadata.model_dump()
 
-                chunks = grounding_metadata.get("grounding_chunks", []) or []
-                citation_pairs = []
+                chunks = grounding_metadata.grounding_chunks or []
+                web_search_queries = grounding_metadata.web_search_queries or []
                 for chunk in chunks:
-                    if not isinstance(chunk, dict):
+                    if not chunk:
                         continue
-                    web = chunk.get("web")
-                    if not isinstance(web, dict):
+                    web = chunk.web
+                    if not web:
                         continue
-                    uri = web.get("uri")
-                    title = web.get("title")
+                    uri = web.uri
+                    title = web.title
                     if uri:
-                        citation_pairs.append((uri, title))
-
-                # Create citation objects from filtered pairs
-                grounding_urls = [UrlCitation(url=url, title=title) for url, title in citation_pairs]
-                citations_urls.extend(grounding_urls)
+                        citations_urls.append(UrlCitation(url=uri, title=title))
 
             # Handle URLs from URL context tool
             if (
@@ -991,22 +1361,29 @@ class Gemini(Model):
                 and hasattr(response.candidates[0], "url_context_metadata")
                 and response.candidates[0].url_context_metadata is not None
             ):
-                url_context_metadata = response.candidates[0].url_context_metadata.model_dump()
-                citations_raw["url_context_metadata"] = url_context_metadata
+                url_context_metadata = response.candidates[0].url_context_metadata
+                citations_raw["url_context_metadata"] = url_context_metadata.model_dump()
 
-                url_metadata_list = url_context_metadata.get("url_metadata", [])
+                url_metadata_list = url_context_metadata.url_metadata or []
                 for url_meta in url_metadata_list:
-                    retrieved_url = url_meta.get("retrieved_url")
-                    status = url_meta.get("url_retrieval_status", "UNKNOWN")
+                    retrieved_url = url_meta.retrieved_url
+                    status = "UNKNOWN"
+                    if url_meta.url_retrieval_status:
+                        status = url_meta.url_retrieval_status.value
                     if retrieved_url and status == "URL_RETRIEVAL_STATUS_SUCCESS":
                         # Avoid duplicate URLs
                         existing_urls = [citation.url for citation in citations_urls]
                         if retrieved_url not in existing_urls:
                             citations_urls.append(UrlCitation(url=retrieved_url, title=retrieved_url))
 
+            if citations_raw:
+                citations.raw = citations_raw
+            if citations_urls:
+                citations.urls = citations_urls
+            if web_search_queries:
+                citations.search_queries = web_search_queries
+
             if citations_raw or citations_urls:
-                citations.raw = citations_raw if citations_raw else None
-                citations.urls = citations_urls if citations_urls else None
                 model_response.citations = citations
 
         # Extract usage metadata if present
@@ -1019,11 +1396,22 @@ class Gemini(Model):
 
         return model_response
 
-    def _parse_provider_response_delta(self, response_delta: GenerateContentResponse) -> ModelResponse:
+    def _parse_provider_response_delta(self, response_delta: GenerateContentResponse, **kwargs) -> ModelResponse:
         model_response = ModelResponse()
 
         if response_delta.candidates and len(response_delta.candidates) > 0:
-            candidate_content = response_delta.candidates[0].content
+            candidate = response_delta.candidates[0]
+            candidate_content = candidate.content
+
+            # Raise if the request failed because of a malformed function call
+            if hasattr(candidate, "finish_reason") and candidate.finish_reason:
+                if candidate.finish_reason == GeminiFinishReason.MALFORMED_FUNCTION_CALL.value:
+                    if self.retry_with_guidance:
+                        raise RetryableModelProviderError(
+                            retry_guidance_message=MALFORMED_FUNCTION_CALL_GUIDANCE,
+                            original_error=f"Generation ended with finish reason: {candidate.finish_reason}",
+                        )
+
             response_message: Content = Content(role="model", parts=[])
             if candidate_content is not None:
                 response_message = candidate_content
@@ -1096,32 +1484,56 @@ class Gemini(Model):
 
                         model_response.tool_calls.append(tool_call)
 
-            if response_delta.candidates[0].grounding_metadata is not None:
-                citations = Citations()
-                grounding_metadata = response_delta.candidates[0].grounding_metadata.model_dump()
-                citations.raw = grounding_metadata
+            citations = Citations()
+            citations.raw = {}
+            citations.urls = []
 
+            if (
+                hasattr(response_delta.candidates[0], "grounding_metadata")
+                and response_delta.candidates[0].grounding_metadata is not None
+            ):
+                grounding_metadata = response_delta.candidates[0].grounding_metadata
+                citations.raw["grounding_metadata"] = grounding_metadata.model_dump()
+                citations.search_queries = grounding_metadata.web_search_queries or []
                 # Extract url and title
-                chunks = grounding_metadata.pop("grounding_chunks", None) or []
-                citation_pairs = []
+                chunks = grounding_metadata.grounding_chunks or []
                 for chunk in chunks:
-                    if not isinstance(chunk, dict):
+                    if not chunk:
                         continue
-                    web = chunk.get("web")
-                    if not isinstance(web, dict):
+                    web = chunk.web
+                    if not web:
                         continue
-                    uri = web.get("uri")
-                    title = web.get("title")
+                    uri = web.uri
+                    title = web.title
                     if uri:
-                        citation_pairs.append((uri, title))
+                        citations.urls.append(UrlCitation(url=uri, title=title))
 
-                # Create citation objects from filtered pairs
-                citations.urls = [UrlCitation(url=url, title=title) for url, title in citation_pairs]
+            # Handle URLs from URL context tool
+            if (
+                hasattr(response_delta.candidates[0], "url_context_metadata")
+                and response_delta.candidates[0].url_context_metadata is not None
+            ):
+                url_context_metadata = response_delta.candidates[0].url_context_metadata
 
+                citations.raw["url_context_metadata"] = url_context_metadata.model_dump()
+
+                url_metadata_list = url_context_metadata.url_metadata or []
+                for url_meta in url_metadata_list:
+                    retrieved_url = url_meta.retrieved_url
+                    status = "UNKNOWN"
+                    if url_meta.url_retrieval_status:
+                        status = url_meta.url_retrieval_status.value
+                    if retrieved_url and status == "URL_RETRIEVAL_STATUS_SUCCESS":
+                        # Avoid duplicate URLs
+                        existing_urls = [citation.url for citation in citations.urls]
+                        if retrieved_url not in existing_urls:
+                            citations.urls.append(UrlCitation(url=retrieved_url, title=retrieved_url))
+
+            if citations.raw or citations.urls:
                 model_response.citations = citations
 
             # Extract usage metadata if present
-            if hasattr(response_delta, "usage_metadata") and response_delta.usage_metadata is not None:
+            if self._should_collect_metrics(response_delta, candidate) and response_delta.usage_metadata is not None:
                 model_response.response_usage = self._get_metrics(response_delta.usage_metadata)
 
         return model_response
@@ -1164,22 +1576,34 @@ class Gemini(Model):
 
         return new_instance
 
-    def _get_metrics(self, response_usage: GenerateContentResponseUsageMetadata) -> Metrics:
+    def _should_collect_metrics(self, response: GenerateContentResponse, candidate: Any) -> bool:
         """
-        Parse the given Google Gemini usage into an Agno Metrics object.
+        Determine if metrics should be collected from the streaming response.
+        """
+        if not hasattr(response, "usage_metadata") or response.usage_metadata is None:
+            return False
+
+        if not self.collect_metrics_on_completion:
+            return True
+
+        return hasattr(candidate, "finish_reason") and candidate.finish_reason is not None
+
+    def _get_metrics(self, response_usage: GenerateContentResponseUsageMetadata) -> MessageMetrics:
+        """
+        Parse the given Google Gemini usage into an Agno MessageMetrics object.
 
         Args:
             response_usage: Usage data from Google Gemini
 
         Returns:
-            Metrics: Parsed metrics data
+            MessageMetrics: Parsed metrics data
         """
-        metrics = Metrics()
+        metrics = MessageMetrics()
 
         metrics.input_tokens = response_usage.prompt_token_count or 0
         metrics.output_tokens = response_usage.candidates_token_count or 0
         if response_usage.thoughts_token_count is not None:
-            metrics.output_tokens += response_usage.thoughts_token_count or 0
+            metrics.reasoning_tokens = response_usage.thoughts_token_count or 0
         metrics.total_tokens = metrics.input_tokens + metrics.output_tokens
 
         metrics.cache_read_tokens = response_usage.cached_content_token_count or 0
@@ -1189,12 +1613,16 @@ class Gemini(Model):
 
         return metrics
 
-    def create_file_search_store(self, display_name: Optional[str] = None) -> Any:
+    def create_file_search_store(
+        self, display_name: Optional[str] = None, embedding_model: Optional[str] = None
+    ) -> Any:
         """
         Create a new File Search store.
 
         Args:
             display_name: Optional display name for the store
+            embedding_model: Optional embedding model to use (e.g., "models/gemini-embedding-2").
+                Use "models/gemini-embedding-2" to enable multimodal (image) file search.
 
         Returns:
             FileSearchStore: The created File Search store object
@@ -1202,19 +1630,27 @@ class Gemini(Model):
         config: Dict[str, Any] = {}
         if display_name:
             config["display_name"] = display_name
+        if embedding_model:
+            config["embedding_model"] = embedding_model
 
         try:
             store = self.get_client().file_search_stores.create(config=config or None)  # type: ignore[arg-type]
             log_info(f"Created File Search store: {store.name}")
             return store
         except Exception as e:
-            log_error(f"Error creating File Search store: {e}")
+            log_error(f"Error creating File Search store: {str(e)}")
             raise
 
-    async def async_create_file_search_store(self, display_name: Optional[str] = None) -> Any:
+    async def async_create_file_search_store(
+        self, display_name: Optional[str] = None, embedding_model: Optional[str] = None
+    ) -> Any:
         """
+        Async version of create_file_search_store.
+
         Args:
             display_name: Optional display name for the store
+            embedding_model: Optional embedding model to use (e.g., "models/gemini-embedding-2").
+                Use "models/gemini-embedding-2" to enable multimodal (image) file search.
 
         Returns:
             FileSearchStore: The created File Search store object
@@ -1222,13 +1658,15 @@ class Gemini(Model):
         config: Dict[str, Any] = {}
         if display_name:
             config["display_name"] = display_name
+        if embedding_model:
+            config["embedding_model"] = embedding_model
 
         try:
             store = await self.get_client().aio.file_search_stores.create(config=config or None)  # type: ignore[arg-type]
             log_info(f"Created File Search store: {store.name}")
             return store
         except Exception as e:
-            log_error(f"Error creating File Search store: {e}")
+            log_error(f"Error creating File Search store: {str(e)}")
             raise
 
     def list_file_search_stores(self, page_size: int = 100) -> List[Any]:
@@ -1248,7 +1686,7 @@ class Gemini(Model):
             log_debug(f"Found {len(stores)} File Search stores")
             return stores
         except Exception as e:
-            log_error(f"Error listing File Search stores: {e}")
+            log_error(f"Error listing File Search stores: {str(e)}")
             raise
 
     async def async_list_file_search_stores(self, page_size: int = 100) -> List[Any]:
@@ -1268,7 +1706,7 @@ class Gemini(Model):
             log_debug(f"Found {len(stores)} File Search stores")
             return stores
         except Exception as e:
-            log_error(f"Error listing File Search stores: {e}")
+            log_error(f"Error listing File Search stores: {str(e)}")
             raise
 
     def get_file_search_store(self, name: str) -> Any:
@@ -1286,7 +1724,7 @@ class Gemini(Model):
             log_debug(f"Retrieved File Search store: {name}")
             return store
         except Exception as e:
-            log_error(f"Error getting File Search store {name}: {e}")
+            log_error(f"Error getting File Search store {name}: {str(e)}")
             raise
 
     async def async_get_file_search_store(self, name: str) -> Any:
@@ -1302,7 +1740,7 @@ class Gemini(Model):
             log_debug(f"Retrieved File Search store: {name}")
             return store
         except Exception as e:
-            log_error(f"Error getting File Search store {name}: {e}")
+            log_error(f"Error getting File Search store {name}: {str(e)}")
             raise
 
     def delete_file_search_store(self, name: str, force: bool = False) -> None:
@@ -1317,7 +1755,7 @@ class Gemini(Model):
             self.get_client().file_search_stores.delete(name=name, config={"force": force})
             log_info(f"Deleted File Search store: {name}")
         except Exception as e:
-            log_error(f"Error deleting File Search store {name}: {e}")
+            log_error(f"Error deleting File Search store {name}: {str(e)}")
             raise
 
     async def async_delete_file_search_store(self, name: str, force: bool = True) -> None:
@@ -1332,7 +1770,7 @@ class Gemini(Model):
             await self.get_client().aio.file_search_stores.delete(name=name, config={"force": force})
             log_info(f"Deleted File Search store: {name}")
         except Exception as e:
-            log_error(f"Error deleting File Search store {name}: {e}")
+            log_error(f"Error deleting File Search store {name}: {str(e)}")
             raise
 
     def wait_for_operation(self, operation: Operation, poll_interval: int = 5, max_wait: int = 600) -> Operation:
@@ -1393,16 +1831,22 @@ class Gemini(Model):
         file_path: Union[str, Path],
         store_name: str,
         display_name: Optional[str] = None,
+        mime_type: Optional[str] = None,
         chunking_config: Optional[Dict[str, Any]] = None,
         custom_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Any:
         """
         Upload a file directly to a File Search store.
 
+        Supports image uploads (image/jpeg, image/png) when the store is created
+        with the "models/gemini-embedding-2" embedding model for multimodal search.
+
         Args:
             file_path: Path to the file to upload
             store_name: Name of the File Search store
             display_name: Optional display name for the file (will be visible in citations)
+            mime_type: Optional MIME type of the file (e.g., "image/jpeg", "image/png", "application/pdf").
+                If not provided, the MIME type will be inferred from the file extension.
             chunking_config: Optional chunking configuration
                 Example: {
                     "white_space_config": {
@@ -1427,6 +1871,8 @@ class Gemini(Model):
         config: Dict[str, Any] = {}
         if display_name:
             config["display_name"] = display_name
+        if mime_type:
+            config["mime_type"] = mime_type
         if chunking_config:
             config["chunking_config"] = chunking_config
         if custom_metadata:
@@ -1442,7 +1888,7 @@ class Gemini(Model):
             log_info(f"Upload initiated for {file_path.name}")
             return operation
         except Exception as e:
-            log_error(f"Error uploading file to File Search store: {e}")
+            log_error(f"Error uploading file to File Search store: {str(e)}")
             raise
 
     async def async_upload_to_file_search_store(
@@ -1450,14 +1896,22 @@ class Gemini(Model):
         file_path: Union[str, Path],
         store_name: str,
         display_name: Optional[str] = None,
+        mime_type: Optional[str] = None,
         chunking_config: Optional[Dict[str, Any]] = None,
         custom_metadata: Optional[List[Dict[str, Any]]] = None,
     ) -> Any:
         """
+        Async version of upload_to_file_search_store.
+
+        Supports image uploads (image/jpeg, image/png) when the store is created
+        with the "models/gemini-embedding-2" embedding model for multimodal search.
+
         Args:
             file_path: Path to the file to upload
             store_name: Name of the File Search store
             display_name: Optional display name for the file
+            mime_type: Optional MIME type of the file (e.g., "image/jpeg", "image/png", "application/pdf").
+                If not provided, the MIME type will be inferred from the file extension.
             chunking_config: Optional chunking configuration
             custom_metadata: Optional custom metadata
 
@@ -1472,6 +1926,8 @@ class Gemini(Model):
         config: Dict[str, Any] = {}
         if display_name:
             config["display_name"] = display_name
+        if mime_type:
+            config["mime_type"] = mime_type
         if chunking_config:
             config["chunking_config"] = chunking_config
         if custom_metadata:
@@ -1487,7 +1943,7 @@ class Gemini(Model):
             log_info(f"Upload initiated for {file_path.name}")
             return operation
         except Exception as e:
-            log_error(f"Error uploading file to File Search store: {e}")
+            log_error(f"Error uploading file to File Search store: {str(e)}")
             raise
 
     def import_file_to_store(
@@ -1525,7 +1981,7 @@ class Gemini(Model):
             log_info(f"Import initiated for {file_name}")
             return operation
         except Exception as e:
-            log_error(f"Error importing file to File Search store: {e}")
+            log_error(f"Error importing file to File Search store: {str(e)}")
             raise
 
     async def async_import_file_to_store(
@@ -1561,7 +2017,7 @@ class Gemini(Model):
             log_info(f"Import initiated for {file_name}")
             return operation
         except Exception as e:
-            log_error(f"Error importing file to File Search store: {e}")
+            log_error(f"Error importing file to File Search store: {str(e)}")
             raise
 
     def list_documents(self, store_name: str, page_size: int = 20) -> List[Any]:
@@ -1582,7 +2038,7 @@ class Gemini(Model):
             log_debug(f"Found {len(documents)} documents in store {store_name}")
             return documents
         except Exception as e:
-            log_error(f"Error listing documents in store {store_name}: {e}")
+            log_error(f"Error listing documents in store {store_name}: {str(e)}")
             raise
 
     async def async_list_documents(self, store_name: str, page_size: int = 20) -> List[Any]:
@@ -1606,7 +2062,7 @@ class Gemini(Model):
             log_debug(f"Found {len(documents)} documents in store {store_name}")
             return documents
         except Exception as e:
-            log_error(f"Error listing documents in store {store_name}: {e}")
+            log_error(f"Error listing documents in store {store_name}: {str(e)}")
             raise
 
     def get_document(self, document_name: str) -> Any:
@@ -1625,7 +2081,7 @@ class Gemini(Model):
             log_debug(f"Retrieved document: {document_name}")
             return doc
         except Exception as e:
-            log_error(f"Error getting document {document_name}: {e}")
+            log_error(f"Error getting document {document_name}: {str(e)}")
             raise
 
     async def async_get_document(self, document_name: str) -> Any:
@@ -1643,7 +2099,7 @@ class Gemini(Model):
             log_debug(f"Retrieved document: {document_name}")
             return doc
         except Exception as e:
-            log_error(f"Error getting document {document_name}: {e}")
+            log_error(f"Error getting document {document_name}: {str(e)}")
             raise
 
     def delete_document(self, document_name: str) -> None:
@@ -1655,7 +2111,7 @@ class Gemini(Model):
 
         Example:
             ```python
-            model = Gemini(id="gemini-2.5-flash")
+            model = Gemini(id="gemini-3.7-flash")
             model.delete_document("fileSearchStores/store-123/documents/doc-456")
             ```
         """
@@ -1663,7 +2119,7 @@ class Gemini(Model):
             self.get_client().file_search_stores.documents.delete(name=document_name)
             log_info(f"Deleted document: {document_name}")
         except Exception as e:
-            log_error(f"Error deleting document {document_name}: {e}")
+            log_error(f"Error deleting document {document_name}: {str(e)}")
             raise
 
     async def async_delete_document(self, document_name: str) -> None:
@@ -1677,5 +2133,47 @@ class Gemini(Model):
             await self.get_client().aio.file_search_stores.documents.delete(name=document_name)
             log_info(f"Deleted document: {document_name}")
         except Exception as e:
-            log_error(f"Error deleting document {document_name}: {e}")
+            log_error(f"Error deleting document {document_name}: {str(e)}")
+            raise
+
+    def download_blob(self, media_id: str) -> Any:
+        """
+        Download a media blob cited by Gemini File Search (multimodal).
+
+        When using multimodal file search with image uploads, the grounding metadata
+        may include a media_id for cited images. Use this method to download the
+        cited image content.
+
+        Args:
+            media_id: The media_id from grounding metadata
+                (e.g., "fileSearchStores/store-123/media/genai-api/blobref/...")
+
+        Returns:
+            The blob content returned by the SDK
+        """
+        try:
+            result = self.get_client().file_search_stores.download_media(media_id=media_id)
+            log_info(f"Downloaded blob: {media_id}")
+            return result
+        except Exception as e:
+            log_error(f"Error downloading blob {media_id}: {str(e)}")
+            raise
+
+    async def async_download_blob(self, media_id: str) -> Any:
+        """
+        Async version of download_blob.
+
+        Args:
+            media_id: The media_id from grounding metadata
+                (e.g., "fileSearchStores/store-123/media/genai-api/blobref/...")
+
+        Returns:
+            The blob content returned by the SDK
+        """
+        try:
+            result = await self.get_client().aio.file_search_stores.download_media(media_id=media_id)
+            log_info(f"Downloaded blob: {media_id}")
+            return result
+        except Exception as e:
+            log_error(f"Error downloading blob {media_id}: {str(e)}")
             raise

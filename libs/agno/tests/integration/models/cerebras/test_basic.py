@@ -6,6 +6,10 @@ from agno.db.sqlite import SqliteDb
 from agno.models.cerebras import Cerebras
 
 
+def test_default_model_id():
+    assert Cerebras().id == "gpt-oss-120b"
+
+
 @pytest.fixture(scope="module")
 def cerebras_model():
     """Fixture that provides a Cerebras model and reuses it across all tests in the module."""
@@ -124,6 +128,7 @@ def test_history(cerebras_model):
         model=cerebras_model,
         db=SqliteDb(db_file="tmp/cerebras/test_basic.db"),
         add_history_to_context=True,
+        store_history_messages=True,
         telemetry=False,
     )
     run_output = agent.run("Hello")

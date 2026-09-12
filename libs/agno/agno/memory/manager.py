@@ -2,7 +2,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from os import getenv
 from textwrap import dedent
-from typing import Any, Callable, Dict, List, Literal, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Type, Union
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +28,9 @@ from agno.utils.log import (
 )
 from agno.utils.prompts import get_json_output_prompt
 from agno.utils.string import parse_response_model_str
+
+if TYPE_CHECKING:
+    from agno.metrics import RunMetrics
 
 
 class MemorySearchResponse(BaseModel):
@@ -82,7 +86,15 @@ class MemoryManager:
         add_memories: bool = True,
         clear_memories: bool = False,
         debug_mode: bool = False,
+        id: Optional[str] = None,
+        name: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        owner_type: Optional[str] = None,
     ):
+        self.id = id if id is not None else f"memory_manager_{uuid4().hex[:8]}"
+        self.name = name
+        self.owner_id = owner_id
+        self.owner_type = owner_type
         self.model = model  # type: ignore[assignment]
         self.system_message = system_message
         self.memory_capture_instructions = memory_capture_instructions
@@ -369,6 +381,7 @@ class MemoryManager:
         agent_id: Optional[str] = None,
         team_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         """Creates memories from multiple messages and adds them to the memory db."""
         self.set_log_level()
@@ -409,6 +422,7 @@ class MemoryManager:
             db=self.db,
             update_memories=self.update_memories,
             add_memories=self.add_memories,
+            run_metrics=run_metrics,
         )
 
         # We refresh from the DB
@@ -422,6 +436,7 @@ class MemoryManager:
         agent_id: Optional[str] = None,
         team_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         """Creates memories from multiple messages and adds them to the memory db."""
         self.set_log_level()
@@ -461,6 +476,7 @@ class MemoryManager:
             db=self.db,
             update_memories=self.update_memories,
             add_memories=self.add_memories,
+            run_metrics=run_metrics,
         )
 
         # We refresh from the DB
@@ -559,8 +575,8 @@ class MemoryManager:
             self.db.upsert_user_memory(memory=memory)
             return "Memory added successfully"
         except Exception as e:
-            log_warning(f"Error storing memory in db: {e}")
-            return f"Error adding memory: {e}"
+            log_warning(f"Error storing memory in db: {str(e)}")
+            return "Error adding memory"
 
     def _delete_db_memory(self, memory_id: str, user_id: Optional[str] = None) -> str:
         """Use this function to delete a memory from the database."""
@@ -574,8 +590,8 @@ class MemoryManager:
             self.db.delete_user_memory(memory_id=memory_id, user_id=user_id)
             return "Memory deleted successfully"
         except Exception as e:
-            log_warning(f"Error deleting memory in db: {e}")
-            return f"Error deleting memory: {e}"
+            log_warning(f"Error deleting memory in db: {str(e)}")
+            return "Error deleting memory"
 
     # -*- Utility Functions
     def search_user_memories(
@@ -589,8 +605,8 @@ class MemoryManager:
 
         Args:
             query: The search query for agentic search. Required if retrieval_method is "agentic".
-            limit: Maximum number of memories to return. Defaults to self.retrieval_limit if not specified. Optional.
-            retrieval_method: The method to use for retrieving memories. Defaults to self.retrieval if not specified.
+            limit: Maximum number of memories to return. Returns every memory if not specified. Optional.
+            retrieval_method: The method to use for retrieving memories. Defaults to "last_n" if not specified.
                 - "last_n": Return the most recent memories
                 - "first_n": Return the oldest memories
                 - "agentic": Return memories most similar to the query, but using an agentic approach
@@ -611,11 +627,6 @@ class MemoryManager:
 
         if not memories:
             return []
-
-        # Use default retrieval method if not specified
-        retrieval_method = retrieval_method
-        # Use default limit if not specified
-        limit = limit
 
         # Handle different retrieval methods
         if retrieval_method == "agentic":
@@ -709,7 +720,7 @@ class MemoryManager:
                     log_warning("Failed to convert memory_search response to MemorySearchResponse")
                     return []
             except Exception as e:
-                log_warning(f"Failed to convert memory_search response to MemorySearchResponse: {e}")
+                log_warning(f"Failed to convert memory_search response to MemorySearchResponse: {str(e)}")
                 return []
 
         memories_to_return = []
@@ -944,7 +955,7 @@ class MemoryManager:
                 _functions.append(func)
                 log_debug(f"Added function {func.name}")
             except Exception as e:
-                log_warning(f"Could not add function {tool}: {e}")
+                log_warning(f"Could not add function {tool}: {str(e)}")
 
         return _functions
 
@@ -1040,6 +1051,7 @@ class MemoryManager:
         team_id: Optional[str] = None,
         update_memories: bool = True,
         add_memories: bool = True,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         if self.model is None:
             log_error("No model provided for memory manager")
@@ -1086,6 +1098,12 @@ class MemoryManager:
             tools=_tools,
         )
 
+        # Accumulate memory model metrics
+        if run_metrics is not None and response.response_usage is not None:
+            from agno.metrics import ModelType, accumulate_model_metrics
+
+            accumulate_model_metrics(response, model_copy, ModelType.MEMORY_MODEL, run_metrics)
+
         if response.tool_calls is not None and len(response.tool_calls) > 0:
             self.memories_updated = True
         log_debug("MemoryManager End", center=True)
@@ -1102,6 +1120,7 @@ class MemoryManager:
         team_id: Optional[str] = None,
         update_memories: bool = True,
         add_memories: bool = True,
+        run_metrics: Optional["RunMetrics"] = None,
     ) -> str:
         if self.model is None:
             log_error("No model provided for memory manager")
@@ -1162,6 +1181,12 @@ class MemoryManager:
             messages=messages_for_model,
             tools=_tools,
         )
+
+        # Accumulate memory model metrics
+        if run_metrics is not None and response.response_usage is not None:
+            from agno.metrics import ModelType, accumulate_model_metrics
+
+            accumulate_model_metrics(response, model_copy, ModelType.MEMORY_MODEL, run_metrics)
 
         if response.tool_calls is not None and len(response.tool_calls) > 0:
             self.memories_updated = True
@@ -1335,8 +1360,8 @@ class MemoryManager:
                 log_debug(f"Memory added: {memory_id}")
                 return "Memory added successfully"
             except Exception as e:
-                log_warning(f"Error storing memory in db: {e}")
-                return f"Error adding memory: {e}"
+                log_warning(f"Error storing memory in db: {str(e)}")
+                return "Error adding memory"
 
         def update_memory(memory_id: str, memory: str, topics: Optional[List[str]] = None) -> str:
             """Use this function to update an existing memory in the database.
@@ -1356,17 +1381,19 @@ class MemoryManager:
                 db.upsert_user_memory(
                     UserMemory(
                         memory_id=memory_id,
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        team_id=team_id,
                         memory=memory,
                         topics=topics,
-                        user_id=user_id,
                         input=input_string,
                     )
                 )
                 log_debug("Memory updated")
                 return "Memory updated successfully"
             except Exception as e:
-                log_warning(f"Error storing memory in db: {e}")
-                return f"Error adding memory: {e}"
+                log_warning(f"Error storing memory in db: {str(e)}")
+                return "Error adding memory"
 
         def delete_memory(memory_id: str) -> str:
             """Use this function to delete a single memory from the database.
@@ -1380,8 +1407,8 @@ class MemoryManager:
                 log_debug("Memory deleted")
                 return "Memory deleted successfully"
             except Exception as e:
-                log_warning(f"Error deleting memory in db: {e}")
-                return f"Error deleting memory: {e}"
+                log_warning(f"Error deleting memory in db: {str(e)}")
+                return "Error deleting memory"
 
         def clear_memory() -> str:
             """Use this function to remove all (or clear all) memories from the database.
@@ -1457,8 +1484,8 @@ class MemoryManager:
                 log_debug(f"Memory added: {memory_id}")
                 return "Memory added successfully"
             except Exception as e:
-                log_warning(f"Error storing memory in db: {e}")
-                return f"Error adding memory: {e}"
+                log_warning(f"Error storing memory in db: {str(e)}")
+                return "Error adding memory"
 
         async def update_memory(memory_id: str, memory: str, topics: Optional[List[str]] = None) -> str:
             """Use this function to update an existing memory in the database.
@@ -1479,6 +1506,9 @@ class MemoryManager:
                     await db.upsert_user_memory(
                         UserMemory(
                             memory_id=memory_id,
+                            user_id=user_id,
+                            agent_id=agent_id,
+                            team_id=team_id,
                             memory=memory,
                             topics=topics,
                             input=input_string,
@@ -1488,6 +1518,9 @@ class MemoryManager:
                     db.upsert_user_memory(
                         UserMemory(
                             memory_id=memory_id,
+                            user_id=user_id,
+                            agent_id=agent_id,
+                            team_id=team_id,
                             memory=memory,
                             topics=topics,
                             input=input_string,
@@ -1496,8 +1529,8 @@ class MemoryManager:
                 log_debug("Memory updated")
                 return "Memory updated successfully"
             except Exception as e:
-                log_warning(f"Error storing memory in db: {e}")
-                return f"Error adding memory: {e}"
+                log_warning(f"Error storing memory in db: {str(e)}")
+                return "Error adding memory"
 
         async def delete_memory(memory_id: str) -> str:
             """Use this function to delete a single memory from the database.
@@ -1508,14 +1541,14 @@ class MemoryManager:
             """
             try:
                 if isinstance(db, AsyncBaseDb):
-                    await db.delete_user_memory(memory_id=memory_id)
+                    await db.delete_user_memory(memory_id=memory_id, user_id=user_id)
                 else:
-                    db.delete_user_memory(memory_id=memory_id)
+                    db.delete_user_memory(memory_id=memory_id, user_id=user_id)
                 log_debug("Memory deleted")
                 return "Memory deleted successfully"
             except Exception as e:
-                log_warning(f"Error deleting memory in db: {e}")
-                return f"Error deleting memory: {e}"
+                log_warning(f"Error deleting memory in db: {str(e)}")
+                return "Error deleting memory"
 
         async def clear_memory() -> str:
             """Use this function to remove all (or clear all) memories from the database.

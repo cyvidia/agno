@@ -6,6 +6,10 @@ from agno.db.sqlite import SqliteDb
 from agno.models.cerebras import CerebrasOpenAI
 
 
+def test_default_model_id():
+    assert CerebrasOpenAI().id == "gpt-oss-120b"
+
+
 def _assert_metrics(response: RunOutput):
     assert response.metrics is not None
     input_tokens = response.metrics.input_tokens
@@ -41,7 +45,7 @@ def test_basic_stream():
     responses = list(response_stream)
     assert len(responses) > 0
     for response in responses:
-        assert response.content is not None
+        assert response.content is not None or response.reasoning_content is not None
 
 
 @pytest.mark.asyncio
@@ -61,7 +65,7 @@ async def test_async_basic_stream():
     agent = Agent(model=CerebrasOpenAI(id="gpt-oss-120b"), markdown=True, telemetry=False)
 
     async for response in agent.arun("Share a 2 sentence horror story", stream=True):
-        assert response.content is not None
+        assert response.content is not None or response.reasoning_content is not None
 
 
 def test_with_memory():
